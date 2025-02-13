@@ -179,6 +179,8 @@ from .utils import (
 from .utils.deprecation import deprecate_kwarg
 from .utils.quantization_config import QuantizationMethod
 
+from torchgraph.graph.export.tools import USE_CUSTOM_OP, USE_COMPILER_DISABLE
+
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -310,7 +312,7 @@ SCALER_NAME = "scaler.pt"
 FSDP_MODEL_NAME = "pytorch_model_fsdp"
 
 
-class Trainer:
+class TraceTrainer:
     """
     Trainer is a simple but feature-complete training and eval loop for PyTorch, optimized for 🤗 Transformers.
 
@@ -426,7 +428,11 @@ class Trainer:
         optimizers: Tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         optimizer_cls_and_kwargs: Optional[Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]] = None,
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+        do_backward: bool = True,
+        do_optimizer: bool = True,
     ):
+        self.do_backward = do_backward
+        self.do_optimizer = do_optimizer
         if args is None:
             output_dir = "tmp_trainer"
             logger.info(f"No `TrainingArguments` passed, using `output_dir={output_dir}`.")
@@ -2388,7 +2394,11 @@ class Trainer:
         self.state.init_training_references(self, train_dataloader, max_steps, num_train_epochs, trial)
 
         # tr_loss is a tensor to avoid synchronization of TPUs through .item()
-        tr_loss = torch.tensor(0.0).to(args.device)
+        from torchgraph.graph.dynamo import dynamo_and_dump
+        torch._dynamo.config.capture_scalar_outputs = True
+        device = args.device
+        epoch_dataloader = list(train_dataloader)
+        tr_loss = torch.tensor(0.0).to(device)
         # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
@@ -2400,10 +2410,6 @@ class Trainer:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
 
         for epoch in range(epochs_trained, num_train_epochs):
-            epoch_dataloader = train_dataloader
-            if hasattr(epoch_dataloader, "set_epoch"):
-                epoch_dataloader.set_epoch(epoch)
-
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
                 self._past = None
@@ -2418,13 +2424,7 @@ class Trainer:
             if epoch == epochs_trained and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
                 self._load_rng_state(resume_from_checkpoint)
 
-            rng_to_sync = False
             steps_skipped = 0
-            if steps_trained_in_current_epoch > 0:
-                epoch_dataloader = skip_first_batches(epoch_dataloader, steps_trained_in_current_epoch)
-                steps_skipped = steps_trained_in_current_epoch
-                steps_trained_in_current_epoch = 0
-                rng_to_sync = True
 
             step = -1
             epoch_iterator = iter(epoch_dataloader)
@@ -2436,159 +2436,127 @@ class Trainer:
             total_updates = steps_in_epoch // args.gradient_accumulation_steps + 1
             if args.gradient_accumulation_steps == 1:
                 total_updates -= 1
+            batch_samples_list = []
+            num_items_in_batch_list = []
             for _ in range(total_updates):
-                update_step += 1
                 num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
                 batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_batches)
-                for i, inputs in enumerate(batch_samples):
-                    step += 1
-                    do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
-                    # Since we perform prefetching, we need to manually set sync_gradients
-                    self.accelerator.gradient_state._set_sync_gradients(do_sync_step)
+                batch_samples_list.append(batch_samples)
+                num_items_in_batch_list.append(num_items_in_batch)
+            model.train()
+            self.optimizer.train()
+            def fn(model, tr_loss=tr_loss, grad_norm=grad_norm, step=step, update_step=update_step, hacked=True):
+                for _, batch_samples, num_items_in_batch in zip(range(total_updates), batch_samples_list, num_items_in_batch_list):
+                    update_step += 1
+                    for i, inputs in enumerate(batch_samples):
+                        step += 1
+                        do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
+                        # Since we perform prefetching, we need to manually set sync_gradients
+                        self.accelerator.gradient_state._set_sync_gradients(do_sync_step)
 
-                    if self.args.include_num_input_tokens_seen:
-                        main_input_name = getattr(self.model, "main_input_name", "input_ids")
-                        if main_input_name not in inputs:
-                            logger.warning(
-                                "Tried to track the number of tokens seen, however the current model is "
-                                "not configured properly to know what item is the input. To fix this, add "
-                                "a `main_input_name` attribute to the model class you are using."
-                            )
-                        else:
-                            input_tokens = inputs[main_input_name].numel()
-                            input_tokens = torch.tensor(input_tokens, device=self.args.device, dtype=torch.int64)
-                            self.state.num_input_tokens_seen += (
-                                self.accelerator.gather(input_tokens).sum().cpu().item()
-                            )
-                    if rng_to_sync:
-                        self._load_rng_state(resume_from_checkpoint)
-                        rng_to_sync = False
-
-                    # Skip past any already trained steps if resuming training
-                    if steps_trained_in_current_epoch > 0:
-                        steps_trained_in_current_epoch -= 1
-                        if steps_trained_progress_bar is not None:
-                            steps_trained_progress_bar.update(1)
-                        if steps_trained_in_current_epoch == 0:
+                        if not hacked and rng_to_sync:
                             self._load_rng_state(resume_from_checkpoint)
-                        continue
-                    elif steps_trained_progress_bar is not None:
-                        steps_trained_progress_bar.close()
-                        steps_trained_progress_bar = None
+                            rng_to_sync = False
 
-                    if step % args.gradient_accumulation_steps == 0:
-                        self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+                        if step % args.gradient_accumulation_steps == 0:
+                            self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                    # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
-                    context = (
-                        functools.partial(self.accelerator.no_sync, model=model)
-                        if i != len(batch_samples) - 1
-                        and self.accelerator.distributed_type != DistributedType.DEEPSPEED
-                        else contextlib.nullcontext
-                    )
-                    with context():
+                        # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
+                        # context = (
+                        #     functools.partial(self.accelerator.no_sync, model=model)
+                        #     if i != len(batch_samples) - 1
+                        #     and self.accelerator.distributed_type != DistributedType.DEEPSPEED
+                        #     else contextlib.nullcontext
+                        # )
+                        # with context():
                         tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
 
-                    if (
-                        args.logging_nan_inf_filter
-                        and not is_torch_xla_available()
-                        and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
-                    ):
-                        # if loss is nan or inf simply add the average of previous logged losses
-                        tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-                    else:
-                        if tr_loss.device != tr_loss_step.device:
-                            raise ValueError(
-                                f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
-                            )
+                        # if (
+                        #     args.logging_nan_inf_filter
+                        #     and not is_torch_xla_available()
+                        #     and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                        # ):
+                        #     # if loss is nan or inf simply add the average of previous logged losses
+                        #     tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                        # else:
+                        #     if tr_loss.device != tr_loss_step.device:
+                        #         raise ValueError(
+                        #             f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
+                        #         )
+                        #     tr_loss = tr_loss + tr_loss_step
                         tr_loss = tr_loss + tr_loss_step
 
-                    self.current_flos += float(self.floating_point_ops(inputs))
+                        # print(f"{do_sync_step=}, {step=}, {update_step=}, {args.gradient_accumulation_steps=}, {tr_loss.item()=}")
+                        if do_sync_step:
+                            # Since we perform prefetching, we need to manually set sync_gradients to True
+                            self.accelerator.gradient_state._set_sync_gradients(True)
 
-                    if do_sync_step:
-                        # Since we perform prefetching, we need to manually set sync_gradients to True
-                        self.accelerator.gradient_state._set_sync_gradients(True)
+                            # Gradient clipping
+                            if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                                if is_sagemaker_mp_enabled() and args.fp16:
+                                    _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
+                                elif self.use_apex:
+                                    # Revert to normal clipping otherwise, handling Apex or full precision
+                                    _grad_norm = nn.utils.clip_grad_norm_(
+                                        amp.master_params(self.optimizer),
+                                        args.max_grad_norm,
+                                    )
+                                else:
+                                    _grad_norm = self.accelerator.clip_grad_norm_(
+                                        model.parameters(),
+                                        args.max_grad_norm,
+                                    )
 
-                        # Gradient clipping
-                        if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                            if is_sagemaker_mp_enabled() and args.fp16:
-                                _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
-                            elif self.use_apex:
-                                # Revert to normal clipping otherwise, handling Apex or full precision
-                                _grad_norm = nn.utils.clip_grad_norm_(
-                                    amp.master_params(self.optimizer),
-                                    args.max_grad_norm,
-                                )
-                            else:
-                                _grad_norm = self.accelerator.clip_grad_norm_(
-                                    model.parameters(),
-                                    args.max_grad_norm,
-                                )
+                                if (
+                                    is_accelerate_available()
+                                    and self.accelerator.distributed_type == DistributedType.DEEPSPEED
+                                ):
+                                    grad_norm = model.get_global_grad_norm()
+                                    # In some cases the grad norm may not return a float
+                                    if hasattr(grad_norm, "item"):
+                                        grad_norm = grad_norm.item()
+                                else:
+                                    grad_norm = _grad_norm
 
-                            if (
-                                is_accelerate_available()
-                                and self.accelerator.distributed_type == DistributedType.DEEPSPEED
-                            ):
-                                grad_norm = model.get_global_grad_norm()
-                                # In some cases the grad norm may not return a float
-                                if hasattr(grad_norm, "item"):
-                                    grad_norm = grad_norm.item()
-                            else:
-                                grad_norm = _grad_norm
+                            self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
+                            if self.do_optimizer:
+                                self.optimizer.step()
 
-                        self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
+                                self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
 
-                        self.optimizer.step()
+                                if not self.accelerator.optimizer_step_was_skipped:
+                                    # Delay optimizer scheduling until metrics are generated
+                                    if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                                        self.lr_scheduler.step()
 
-                        self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
+                                model.zero_grad()
+                            self.state.global_step += 1
+                            self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                            self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        else:
+                            self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
-                        if not self.accelerator.optimizer_step_was_skipped:
-                            # Delay optimizer scheduling until metrics are generated
-                            if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                                self.lr_scheduler.step()
-
-                        model.zero_grad()
-                        self.state.global_step += 1
-                        self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                        self._maybe_log_save_evaluate(
-                            tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time
-                        )
-                    else:
-                        self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
-
-                    # PyTorch/XLA relies on the data loader to insert the mark_step for
-                    # each step. Since we are breaking the loop early, we need to manually
-                    # insert the mark_step here.
+                        # PyTorch/XLA relies on the data loader to insert the mark_step for
+                        # each step. Since we are breaking the loop early, we need to manually
+                        # insert the mark_step here.
+                        if self.control.should_epoch_stop or self.control.should_training_stop:
+                            if is_torch_xla_available():
+                                xm.mark_step()
+                            break
+                    # We also need to break out of the nested loop
                     if self.control.should_epoch_stop or self.control.should_training_stop:
                         if is_torch_xla_available():
                             xm.mark_step()
                         break
-                # We also need to break out of the nested loop
-                if self.control.should_epoch_stop or self.control.should_training_stop:
-                    if is_torch_xla_available():
-                        xm.mark_step()
-                    break
-            if step < 0:
-                logger.warning(
-                    "There seems not to be a single sample in your epoch_iterator, stopping training at step"
-                    f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
-                    f" num_steps ({max_steps}) higher than the number of available samples."
-                )
-                self.control.should_training_stop = True
+                return tr_loss, grad_norm, step, update_step
+            dirname = os.environ.get("TG_DUMP_DIRNAME", "export_dir")
+            os.makedirs(dirname, exist_ok=True)
+            _, _, _, res = dynamo_and_dump(model, fn, compile_model_or_fn="fn", dirname=dirname, formats=["code"], rank=0, return_res=True)
+            # res = fn(model)
+            tr_loss, grad_norm, step, update_step = res
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time)
 
-            if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
-                if is_torch_xla_available():
-                    # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
-                    xm.master_print(met.metrics_report())
-                else:
-                    logger.warning(
-                        "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
-                        "configured. Check your training configuration if this is unexpected."
-                    )
             if self.control.should_training_stop:
                 break
 
@@ -3522,13 +3490,14 @@ class Trainer:
         elif isinstance(data, (tuple, list)):
             return type(data)(self._prepare_input(v) for v in data)
         elif isinstance(data, torch.Tensor):
-            kwargs = {"device": self.args.device}
-            if self.is_deepspeed_enabled and (torch.is_floating_point(data) or torch.is_complex(data)):
-                # NLP models inputs are int/uint and those get adjusted to the right dtype of the
-                # embedding. Other models such as wav2vec2's inputs are already float and thus
-                # may need special handling to match the dtypes of the model
-                kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
-            return data.to(**kwargs)
+            # kwargs = {"device": self.args.device}
+            # if self.is_deepspeed_enabled and (torch.is_floating_point(data) or torch.is_complex(data)):
+            #     # NLP models inputs are int/uint and those get adjusted to the right dtype of the
+            #     # embedding. Other models such as wav2vec2's inputs are already float and thus
+            #     # may need special handling to match the dtypes of the model
+            #     kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
+            # return data.to(**kwargs)
+            ...
         return data
 
     def _prepare_inputs(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
@@ -3585,12 +3554,12 @@ class Trainer:
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
-        model.train()
-        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
-            self.optimizer.train()
+        # model.train()
+        # if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+        #     self.optimizer.train()
 
         inputs = self._prepare_inputs(inputs)
-        if is_sagemaker_mp_enabled():
+        if not (USE_CUSTOM_OP or USE_COMPILER_DISABLE) and is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
 
@@ -3599,7 +3568,8 @@ class Trainer:
 
         del inputs
         if (
-            self.args.torch_empty_cache_steps is not None
+            not (USE_CUSTOM_OP or USE_COMPILER_DISABLE)
+            and self.args.torch_empty_cache_steps is not None
             and self.state.global_step % self.args.torch_empty_cache_steps == 0
         ):
             if is_torch_xpu_available():
@@ -3636,8 +3606,8 @@ class Trainer:
             # https://github.com/huggingface/transformers/pull/35808
             if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                 kwargs["scale_wrt_gas"] = False
-
-            self.accelerator.backward(loss, **kwargs)
+            if self.do_backward:
+                self.accelerator.backward(loss, **kwargs)
 
             return loss.detach()
 
@@ -3662,7 +3632,9 @@ class Trainer:
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
-        if labels is not None:
+        if USE_CUSTOM_OP or USE_COMPILER_DISABLE:
+            loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
+        elif labels is not None:
             unwrapped_model = self.accelerator.unwrap_model(model)
             if _is_peft_model(unwrapped_model):
                 model_name = unwrapped_model.base_model.model._get_name()
@@ -5067,6 +5039,26 @@ class Trainer:
                 fsdp_plugin.set_mixed_precision(
                     self.model.hf_quantizer.quantization_config.bnb_4bit_quant_storage, override=True
                 )
+
+    def get_batch_samples_from_list(self, epoch_iterator: list, begin: int, num_batches: int):
+        batch_samples = []
+        num_items_in_batch = None
+        batch_samples = epoch_iterator[begin:begin+num_batches]
+
+        if len(batch_samples) > 0 and "labels" in batch_samples[0]:
+            # For now we don't support object detection
+            try:
+                num_items_in_batch = sum([(batch["labels"].ne(-100)).sum() for batch in batch_samples])
+            except (TypeError, AttributeError):
+                pass
+
+        if self.args.average_tokens_across_devices and num_items_in_batch is not None:
+            num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum().item()
+
+        if torch.is_tensor(num_items_in_batch):
+            num_items_in_batch = num_items_in_batch.item()
+
+        return batch_samples, num_items_in_batch
 
     def get_batch_samples(self, epoch_iterator, num_batches):
         batch_samples = []

@@ -1,18 +1,4 @@
-# coding=utf-8
-# Copyright 2018 the HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+import os
 import tempfile
 from functools import partial
 
@@ -138,64 +124,74 @@ def main():
         "max_grad_norm": None,
     }
 
-    # base
-    base_loss_callback = StoreLossCallback()
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        args = TrainingArguments(
-            tmp_dir,
-            **args_kwargs,
-        )
-        set_seed(42)
-        model = MyModule()
-        trainer = TraceTrainer(
-            model,
-            args,
-            train_dataset=train_dataset,
-            callbacks=[base_loss_callback],
-            compute_loss_func=partial(my_loss, name="base"),
-        )
-        assert trainer.model_accepts_loss_kwargs
-        trainer.train()
+    EXAMPLE_TYPE = os.environ.get("EXAMPLE_TYPE")
 
-    grad_accum_loss_callback = StoreLossCallback()
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        args = TrainingArguments(
-            tmp_dir,
-            **args_kwargs,
-            gradient_accumulation_steps=2,
-            per_device_train_batch_size=4,
-        )
-        set_seed(42)
-        model = MyModule()
-        trainer = TraceTrainer(
-            model,
-            args,
-            train_dataset=train_dataset,
-            callbacks=[grad_accum_loss_callback],
-            compute_loss_func=partial(my_loss, name="fixed"),
-        )
-        trainer.train()
-
-    broken_loss_callback = StoreLossCallback()
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        args = TrainingArguments(
-            tmp_dir,
-            **args_kwargs,
-            gradient_accumulation_steps=2,
-            per_device_train_batch_size=4,
-        )
-        set_seed(42)
-        model = MyModule()
-        trainer = TraceTrainer(
-            model,
-            args,
-            train_dataset=train_dataset,
-            callbacks=[broken_loss_callback],
-            compute_loss_func=partial(
-                my_loss, disable_num_items_in_batch=True, name="broken"
-            ),
-        )
-        trainer.train()
+    if EXAMPLE_TYPE == "base":
+        base_loss_callback = StoreLossCallback()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = TrainingArguments(
+                tmp_dir,
+                **args_kwargs,
+            )
+            set_seed(42)
+            model = MyModule()
+            trainer = TraceTrainer(
+                model,
+                args,
+                train_dataset=train_dataset,
+                callbacks=[base_loss_callback],
+                compute_loss_func=partial(my_loss, name="base"),
+                do_backward=False,
+                do_optimizer=False,
+            )
+            assert trainer.model_accepts_loss_kwargs
+            trainer.train()
+    elif EXAMPLE_TYPE == "accum":
+        grad_accum_loss_callback = StoreLossCallback()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = TrainingArguments(
+                tmp_dir,
+                **args_kwargs,
+                gradient_accumulation_steps=2,
+                per_device_train_batch_size=4,
+            )
+            set_seed(42)
+            model = MyModule()
+            trainer = TraceTrainer(
+                model,
+                args,
+                train_dataset=train_dataset,
+                callbacks=[grad_accum_loss_callback],
+                compute_loss_func=partial(my_loss, name="fixed"),
+                do_backward=False,
+                do_optimizer=False,
+            )
+            trainer.train()
+    elif EXAMPLE_TYPE == "broken":
+        broken_loss_callback = StoreLossCallback()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = TrainingArguments(
+                tmp_dir,
+                **args_kwargs,
+                gradient_accumulation_steps=2,
+                per_device_train_batch_size=4,
+            )
+            set_seed(42)
+            model = MyModule()
+            trainer = TraceTrainer(
+                model,
+                args,
+                train_dataset=train_dataset,
+                callbacks=[broken_loss_callback],
+                compute_loss_func=partial(
+                    my_loss, disable_num_items_in_batch=True, name="broken"
+                ),
+                do_backward=False,
+                do_optimizer=False,
+            )
+            trainer.train()
+    else:
+        raise ValueError(f"Unknown EXAMPLE_TYPE: {EXAMPLE_TYPE}, should be 'base', 'accum' or 'broken'.")
 
 
 if __name__ == "__main__":
