@@ -4066,6 +4066,7 @@ else:
     ]
     _import_structure["sagemaker"] = []
     _import_structure["time_series_utils"] = []
+    _import_structure["trace_trainer"] = ["TraceTrainer"]
     _import_structure["trainer"] = ["Trainer"]
     _import_structure["trainer_pt_utils"] = ["torch_distributed_zero_first"]
     _import_structure["trainer_seq2seq"] = ["Seq2SeqTrainer"]
@@ -8654,6 +8655,7 @@ if TYPE_CHECKING:
         from .pytorch_utils import Conv1D, apply_chunking_to_forward, prune_layer
 
         # Trainer
+        from .trace_trainer import TraceTrainer
         from .trainer import Trainer
         from .trainer_pt_utils import torch_distributed_zero_first
         from .trainer_seq2seq import Seq2SeqTrainer
